@@ -1,0 +1,10 @@
+build/*
+client.c
+client
+a.sh
+lib/*
+Dockerfile.server
+Dockerfile.client
+docker-compose.yml
+debug.sh
+
