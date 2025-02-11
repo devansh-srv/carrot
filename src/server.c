@@ -8,7 +8,6 @@
 /* // Add debug prints in key locations */
 /* DEBUG_PRINT("Connection received from %s:%d", inet_ntoa(client.sin_addr), */
 /*             ntohs(client.sin_port)); */
-
 #include <arpa/inet.h>
 #include <asm-generic/socket.h>
 #include <assert.h>
@@ -31,6 +30,7 @@
 #include <unistd.h>
 /* const size_t MAX_PAYLOAD_SIZE = 4096; // scale this shit up */
 const size_t MAX_PAYLOAD_SIZE = 32 << 20;
+const size_t MAX_ARGS = 200 * 1000;
 
 void error(const char *msg) { perror(msg); }
 void errno_msg(const char *msg) {
@@ -46,7 +46,7 @@ void nonB(int fd) {
     exit(0);
   }
   flags |= O_NONBLOCK;
-  (void)fcntl(fd, F_SETFL, flags);
+  fcntl(fd, F_SETFL, flags);
   if (errno) {
     errno_msg("fnctl() set flag");
     exit(0);
@@ -138,11 +138,103 @@ bool one_req(struct Conn *conn) {
   return true;
 }
 
+// for reading uint32_t type
+bool read_u32(uint8_t **curr, uint8_t *end, uint32_t *out) {
+
+  if (*curr + 4 > end) {
+    return false;
+  }
+  memcpy(out, *curr, 4);
+  *curr += 4;
+  return true;
+}
+// for reading string type
+bool read_str(uint8_t **curr, uint8_t *end, size_t len, char **out) {
+
+  if (*curr + len > end) {
+    return false;
+  }
+  *out = (char *)malloc(len + 1);
+  if (out == NULL) {
+    error("calloc failed @ read_str");
+    exit(EXIT_FAILURE);
+  }
+  memcpy(*out, *curr, len);
+  *curr += len;
+  return true;
+}
+
+// parser
+int parse_req(uint8_t *data, size_t len, char ***out, int *out_size,
+              int *out_cap) {
+  uint8_t *end = data + len;
+  uint32_t num_str = 0;
+  if (!read_u32(&data, end, &num_str)) {
+    error("parse_req 1 failed");
+    exit(EXIT_FAILURE);
+  }
+  if (num_str > MAX_ARGS) {
+    error("args too long");
+    exit(EXIT_FAILURE);
+  }
+  while (*out_size < num_str) {
+    uint32_t len = 0;
+    if (!read_u32(&data, end, &len)) {
+      error("failed to read len in parse_req");
+      exit(EXIT_FAILURE);
+    }
+    if (*out_size >= *out_cap) {
+      int new_cap = (*out_cap) * 2;
+      char **tmp = (char **)realloc(*out, new_cap);
+      if (tmp == NULL) {
+        exit(EXIT_FAILURE);
+      }
+      *out = tmp;
+      *out_cap = new_cap;
+    }
+    char *s = NULL;
+    if (!read_str(&data, end, len, &s)) {
+      error("failed to read str in parse_req");
+      exit(EXIT_FAILURE);
+    }
+    (*out)[*out_size] = s;
+    (*out_size)++;
+  }
+  if (data != end) {
+    error("garbage parse_req");
+    exit(EXIT_FAILURE);
+  }
+  return 0;
+}
+
+// handling response status as an enum
+enum {
+  RES_OK = 0,
+  RES_ERR = 1,
+  RES_NX = 2,
+};
+
+// response struct
+struct Response {
+  int status;
+  uint8_t **data;
+  int data_size;
+  int data_cap;
+};
+
+void make_res(struct Response *resp, uint8_t ***out, int *out_size,
+              int *out_cap) {
+  int res_len = 4 + resp->data_size;
+  append_buf(*out, (uint8_t *)&res_len, 4, out_size, out_cap);
+  append_buf(*out, (uint8_t *)&resp->status, 4, out_size, out_cap);
+  append_buf(*out, *resp->data, resp->data_size, out_size, out_cap);
+}
 // callback for accept
 // accept client connection
 // initializes a struct Conn* instance conn
 // returns client conn state
-struct Conn *handle_accpet(int fd) {
+
+struct Conn *handle_accept(int fd) {
   struct sockaddr_in client;
   socklen_t clilen = sizeof(client);
   errno = 0;
@@ -327,7 +419,7 @@ int main(int argc, char *argv[]) {
       exit(0);
     }
     if (poll_args[0].revents) {
-      struct Conn *conn = handle_accpet(fd);
+      struct Conn *conn = handle_accept(fd);
       if (conn && conn->fd >= 0) {
         if (fdconn_cap < (size_t)conn->fd + 1) {
           int new_cap = (size_t)conn->fd + 1;
