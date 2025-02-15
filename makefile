@@ -16,7 +16,7 @@ all:$(TARGET)
 $(TARGET): $(OBJECTS)
 	gcc $(CFLAGS) $^ -o $@
 
-$(OBJDIR)/%.o: $(SRCDIR)/$.c
+$(BUILDDIR)/%.o: $(SRCDIR)/$.c
 	gcc $(CFLAGS) -c $< -o $@
 
 clean:

@@ -8,6 +8,7 @@
 /* // Add debug prints in key locations */
 /* DEBUG_PRINT("Connection received from %s:%d", inet_ntoa(client.sin_addr), */
 /*             ntohs(client.sin_port)); */
+#include "../lib/hashtable.h"
 #include <arpa/inet.h>
 #include <asm-generic/socket.h>
 #include <assert.h>
@@ -28,6 +29,11 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+// macro for finding the base pointer to struct
+#define container_of(ptr, type, member)                                        \
+  (type *)((char *)ptr - offsetof(type, member))
+
 /* const size_t MAX_PAYLOAD_SIZE = 4096; // scale this shit up */
 const size_t MAX_PAYLOAD_SIZE = 32 << 20;
 const size_t MAX_ARGS = 200 * 1000;
@@ -49,7 +55,7 @@ void nonB(int fd) {
   fcntl(fd, F_SETFL, flags);
   if (errno) {
     errno_msg("fnctl() set flag");
-    exit(0);
+    return;
   }
 }
 
@@ -82,7 +88,7 @@ void append_buf(uint8_t **incoming, uint8_t *data, size_t len,
     *incoming = tmp;
     (*incoming_capacity) = new_cap;
   }
-  memcpy(&(*incoming)[*incoming_size], data, len * sizeof(uint8_t));
+  memcpy(*incoming + *incoming_size, data, len * sizeof(uint8_t));
   (*incoming_size) += len;
 }
 
@@ -108,98 +114,81 @@ void consume_buf(uint8_t **incoming, size_t len, int *incoming_size,
   }
 }
 
-// sends one req at a time (echoing right now)
-// simply copies the incoming to outgoing to send to server
-bool one_req(struct Conn *conn) {
-  if (conn->incoming_size < 4) {
-    return false;
-  }
-  uint32_t len = 0;
-  memcpy(&len, conn->incoming, 4);
-  int host_len = ntohl(len);
-  if ((size_t)host_len > MAX_PAYLOAD_SIZE) {
-    error("msg too long");
-    conn->want_close = true;
-    return false;
-  }
-  if (host_len + 4 > conn->incoming_size) {
-    return false;
-  }
-  uint8_t *req = &(conn->incoming[4]);
-  /* printf("client says: len:%d data:%.*s\n", host_len, */
-  /*        host_len < 100 ? host_len : 100, req); */
-  printf("client says: len:%d data:%s\n", host_len, req);
-  append_buf(&conn->outgoing, (uint8_t *)&len, 4, &conn->outgoing_size,
-             &conn->outgoing_capacity);
-  append_buf(&conn->outgoing, req, host_len, &conn->outgoing_size,
-             &conn->outgoing_capacity);
-  consume_buf(&conn->incoming, 4 + host_len, &conn->incoming_size,
-              &conn->incoming_capacity);
-  return true;
-}
-
 // for reading uint32_t type
 bool read_u32(uint8_t **curr, uint8_t *end, uint32_t *out) {
 
   if (*curr + 4 > end) {
     return false;
   }
-  memcpy(out, *curr, 4);
+  uint32_t net_val;
+  memcpy(&net_val, *curr, 4);
+
+  *out = ntohl(net_val);
   *curr += 4;
   return true;
 }
-// for reading string type
+// for reading string typ
 bool read_str(uint8_t **curr, uint8_t *end, size_t len, char **out) {
 
   if (*curr + len > end) {
     return false;
   }
   *out = (char *)malloc(len + 1);
-  if (out == NULL) {
-    error("calloc failed @ read_str");
-    exit(EXIT_FAILURE);
+  if (*out == NULL) {
+    error("malloc failed @ read_str");
+    return false;
   }
   memcpy(*out, *curr, len);
+  (*out)[len] = '\0';
   *curr += len;
   return true;
 }
 
 // parser
-int parse_req(uint8_t *data, size_t len, char ***out, int *out_size,
+int parse_req(uint8_t *data, size_t len, char **out, int *out_size,
               int *out_cap) {
   uint8_t *end = data + len;
   uint32_t num_str = 0;
+  // reads the  number of strings in the redis command 4 bytes
   if (!read_u32(&data, end, &num_str)) {
     error("parse_req 1 failed");
     exit(EXIT_FAILURE);
   }
+  /* printf("num_str: %d\n", num_str); */
   if (num_str > MAX_ARGS) {
+
     error("args too long");
-    exit(EXIT_FAILURE);
+    return -1;
   }
-  while (*out_size < num_str) {
+  // loops untill reads every (len:string) in the redis command
+  while ((uint32_t)*out_size < num_str) {
+    // reads the strlen of redis command string
+    if (*out_size >= *out_cap) {
+      int new_cap = (*out_cap) * 2;
+      char *tmp = (char *)realloc(*out, new_cap);
+      if (!tmp) {
+        error("cmd tmp realloc failed");
+        exit(EXIT_FAILURE);
+      }
+      *out_cap = new_cap;
+      *out = tmp;
+    }
     uint32_t len = 0;
+    /* reads the command string */
     if (!read_u32(&data, end, &len)) {
       error("failed to read len in parse_req");
       exit(EXIT_FAILURE);
-    }
-    if (*out_size >= *out_cap) {
-      int new_cap = (*out_cap) * 2;
-      char **tmp = (char **)realloc(*out, new_cap);
-      if (tmp == NULL) {
-        exit(EXIT_FAILURE);
-      }
-      *out = tmp;
-      *out_cap = new_cap;
     }
     char *s = NULL;
     if (!read_str(&data, end, len, &s)) {
       error("failed to read str in parse_req");
       exit(EXIT_FAILURE);
     }
-    (*out)[*out_size] = s;
+    (out)[*out_size] = s;
     (*out_size)++;
+    printf("out_size: %d\n", *out_size);
   }
+  // trailing garbage
   if (data != end) {
     error("garbage parse_req");
     exit(EXIT_FAILURE);
@@ -216,24 +205,226 @@ enum {
 
 // response struct
 struct Response {
-  int status;
-  uint8_t **data;
-  int data_size;
-  int data_cap;
+  uint32_t status;
+  uint8_t *data;
+  size_t data_size;
+  size_t data_cap;
 };
 
-void make_res(struct Response *resp, uint8_t ***out, int *out_size,
+// global declaration and init of the hashMap db
+struct {
+  struct HashMap db;
+} g_data;
+
+struct Entry {
+  struct HashNode node;
+  char *key;
+  char *val;
+};
+
+// to check the equality of the keys using the container_of macro
+// the same function whose pointer is passed in the hashMap functions for
+// checking the inequality of nodes bool(*eq)(struct HashNode*a,struct HashNode*
+// b)
+bool entry_eq(struct HashNode *a, struct HashNode *b) {
+  struct Entry *aa = container_of(a, struct Entry, node);
+  struct Entry *bb = container_of(b, struct Entry, node);
+  // checks the equality of the key strings
+  // uses strcmp so be we need to return true when evaluates to 0
+  int res = strcmp(aa->key, bb->key);
+  if (res == 0)
+    return true;
+  return false;
+}
+
+// FNV hash because it is fast
+uint64_t str_hash(uint8_t *data, size_t len) {
+  uint32_t h = 0x811C9DC5;
+  for (size_t i = 0; i < len; i++) {
+    h = (h + data[i]) * 0x01000193;
+  }
+  return h;
+}
+
+// get command handler for redis command `get`
+// reads the key in struct Entry* and looks up in the hashMap with key hashCode
+void do_get(char **cmd, struct Response *res) {
+  struct Entry key;
+  if (cmd[1] != NULL) {
+    key.key = cmd[1];
+  } else {
+    error("cmd[1] is null");
+    return;
+  }
+  /* printf(cmd[1]); */
+  /* printf("\n"); */
+  key.node.hashCode = str_hash((uint8_t *)key.key, strlen(key.key));
+  struct HashNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (!node) {
+    printf("hey there");
+    /* did not find the key  */
+    res->status = RES_NX;
+    return;
+  }
+  struct Entry *x = container_of(node, struct Entry, node);
+  // found the key
+  // length of the response aka the val
+  size_t length = strlen(x->val);
+  assert(length <= MAX_PAYLOAD_SIZE);
+
+  // prepares the response
+  memcpy(res->data, x->val, length);
+  res->data_size = length;
+}
+
+// set handler for redis command `set`
+void do_set(char **cmd) {
+  struct Entry key;
+  if (cmd[1] != NULL) {
+    key.key = cmd[1];
+  } else {
+    error("cmd[1] is null");
+    return;
+  }
+  /* printf(cmd[1]); */
+  /* printf("\n"); */
+  key.node.hashCode = str_hash((uint8_t *)key.key, strlen(key.key));
+  struct HashNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (node) {
+    // successfully found the node
+    // uses base pointer to assign the val
+    struct Entry *x = container_of(node, struct Entry, node);
+    x->val = strdup(cmd[2]);
+  } else {
+    struct Entry *ent = (struct Entry *)malloc(sizeof(struct Entry));
+    if (!ent) {
+      error("ent malloc failed");
+      exit(EXIT_FAILURE);
+    }
+    // prepares the node for hm_insert
+    ent->key = strdup(key.key);
+    ent->node.hashCode = key.node.hashCode;
+    ent->val = strdup(cmd[2]);
+    hm_insert(&g_data.db, &ent->node);
+  }
+}
+
+// del handler for redis command `del`
+void do_del(char **cmd, struct Response *res) {
+  struct Entry key;
+  if (cmd[1] != NULL) {
+    key.key = cmd[1];
+  } else {
+    error("cmd[1] is null");
+    return;
+  }
+  /* printf(cmd[1]); */
+  /* printf("\n"); */
+  key.node.hashCode = str_hash((uint8_t *)key.key, strlen(key.key));
+  struct HashNode *node = hm_del(&g_data.db, &key.node, &entry_eq);
+  if (node) {
+    /* successfully deleted the node from hashMap */
+    struct Entry *entry = container_of(node, struct Entry, node);
+    /* prepares the response */
+    free(entry->key);
+    free(entry->val);
+    free(entry);
+  } else {
+    res->status = RES_NX;
+  }
+}
+
+// req handler
+void do_req(char **cmd, int *cmd_size, struct Response *res) {
+  if (*cmd_size == 2 && strcmp(cmd[0], "get") == 0) {
+    return do_get(cmd, res);
+  } else if (*cmd_size == 3 && strcmp(cmd[0], "set") == 0) {
+    return do_set(cmd);
+  } else if (*cmd_size == 2 && strcmp(cmd[0], "del") == 0) {
+    return do_del(cmd, res);
+  } else {
+    res->status = RES_NX;
+  }
+}
+
+// function to prepare the response message
+void make_res(struct Response *resp, uint8_t **out, int *out_size,
               int *out_cap) {
-  int res_len = 4 + resp->data_size;
-  append_buf(*out, (uint8_t *)&res_len, 4, out_size, out_cap);
-  append_buf(*out, (uint8_t *)&resp->status, 4, out_size, out_cap);
-  append_buf(*out, *resp->data, resp->data_size, out_size, out_cap);
+  uint32_t res_len = 4 + (uint32_t)resp->data_size;
+  // length of the response
+  append_buf(out, (uint8_t *)&res_len, 4, out_size, out_cap);
+  // resp.status
+  append_buf(out, (uint8_t *)&(resp->status), 4, out_size, out_cap);
+  /* printf("%u\n", (*out)[4]); */
+  /* printf("%u\n", (*out)[5]); */
+  /* printf("%u\n", (*out)[6]); */
+  /* printf("%u\n", (*out)[7]); */
+  // resp.data (if any)
+  append_buf(out, resp->data, resp->data_size, out_size, out_cap);
 }
 // callback for accept
 // accept client connection
 // initializes a struct Conn* instance conn
 // returns client conn state
 
+// sends one req at a time
+// parses req and gets the prepared response to read req and write response
+bool one_req(struct Conn *conn) {
+  if (conn->incoming_size < 4) {
+    return false;
+  }
+  uint32_t len = 0;
+  memcpy(&len, conn->incoming, 4);
+  uint32_t host_len = ntohl(len);
+  printf("Network order len: %u (0x%08x)\n", len, len);
+  printf("Host order len: %u (0x%08x)\n", host_len, host_len);
+  printf("len: %u\n", len);
+  printf("host_len: %u\n", host_len);
+  if ((size_t)host_len > MAX_PAYLOAD_SIZE) {
+    error("msg too long");
+    conn->want_close = true;
+    return false;
+  }
+  if (host_len + 4 > conn->incoming_size) {
+    return false;
+  }
+  uint8_t *req = &(conn->incoming[4]);
+  char **cmd = (char **)calloc(100, sizeof(char *));
+  if (!cmd) {
+    error("cmd calloc failed");
+    exit(EXIT_FAILURE);
+  }
+  int cmd_size = 0;
+  int cmd_cap = 100;
+  int p = parse_req(req, host_len, cmd, &cmd_size, &cmd_cap);
+  if (p < 0) {
+    error("bad_req");
+    conn->want_close = true;
+    return false;
+  }
+  // Response init
+  struct Response resp = {0,
+                          (uint8_t *)malloc(MAX_PAYLOAD_SIZE * sizeof(uint8_t)),
+                          0, MAX_PAYLOAD_SIZE};
+  if (!resp.data) {
+    error("resp.data malloc failed");
+    free(cmd);
+    return false;
+  }
+  do_req(cmd, &cmd_size, &resp);
+  make_res(&resp, &conn->outgoing, &conn->outgoing_size,
+           &conn->outgoing_capacity);
+  free(resp.data);
+  for (size_t i = 0; i < cmd_size; i++) {
+    free(cmd[i]);
+  }
+  free(cmd);
+  consume_buf(&conn->incoming, 4 + host_len, &conn->incoming_size,
+              &conn->incoming_capacity);
+  return true;
+}
+
+// handle for accepting connections
 struct Conn *handle_accept(int fd) {
   struct sockaddr_in client;
   socklen_t clilen = sizeof(client);
@@ -318,10 +509,15 @@ void handle_read(struct Conn *conn) {
     conn->want_close = true;
     return;
   }
+  /* printf("Received %d bytes: ", err); */
+  /* for (int i = 0; i < err; i++) { */
+  /*   printf("%02x ", buf[i]); */
+  /* } */
+  /* printf("\n"); */
   append_buf(&conn->incoming, buf, (size_t)err, &conn->incoming_size,
              &conn->incoming_capacity);
 
-  // isn't very clear
+  // keeps reading requests and writing responses
   while (one_req(conn)) {
   }
 
@@ -383,11 +579,6 @@ int main(int argc, char *argv[]) {
       if (!conn) {
         continue;
       }
-      /* printf("%d bool: %d, %d, %d\n", conn->fd, conn->want_read, */
-      /*        conn->want_write, conn->want_close); */
-      /* printf("%d %d %d %d", conn->incoming_size, conn->incoming_capacity, */
-      /*        conn->outgoing_size, conn->outgoing_capacity); */
-
       struct pollfd pfd = {conn->fd, POLLERR, 0};
       if (conn->want_read) {
         pfd.events |= POLLIN;
