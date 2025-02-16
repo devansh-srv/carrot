@@ -82,7 +82,7 @@ int send_query(int sockfd, char **cmd, int *cmd_size, int *cmd_cap) {
   uint32_t n_len = htonl(len);
   printf("n_len: %u\n", n_len);
   memcpy(wbuf, &n_len, 4);
-  int cmd_size_net = htonl(*cmd_size);
+  uint32_t cmd_size_net = htonl(*cmd_size);
   memcpy(wbuf + 4, &cmd_size_net, 4);
   size_t curr = 8;
   for (int i = 0; i < *cmd_size; i++) {
@@ -99,6 +99,110 @@ int send_query(int sockfd, char **cmd, int *cmd_size, int *cmd_cap) {
   return ret;
 }
 
+// tags for TLV serialization
+enum {
+  TAG_NIL = 0, // null
+  TAG_ERR = 1, // error code + msg
+  TAG_STR = 2, // string
+  TAG_INT = 3, // int64
+  TAG_DBL = 4, // double
+  TAG_ARR = 5, // array
+};
+
+/* util function to print the message */
+
+int print_res(uint8_t *data, uint32_t len) {
+  if (len < 1) {
+    error("Bad response");
+    return -1;
+  }
+  switch (data[0]) {
+  case TAG_NIL:
+    printf("(nil)\n");
+    return 1;
+  case TAG_ERR:
+    if (len < 1 + 8) {
+      error("Bad response");
+      return -1;
+    }
+    {
+      int32_t err_code = 0;
+      uint32_t size = 0;
+      memcpy(&err_code, data + 1, 4);
+      memcpy(&size, data + 5, 4);
+      printf("code: %d\n", err_code);
+      printf("size: %u\n", size);
+      if (len < 1 + 8 + size) {
+        error("Bad response");
+        return -1;
+      }
+      printf("(err) %d %.*s\n", err_code, size, data + 9);
+      return 1 + 8 + len;
+    }
+  case TAG_STR:
+    if (len < 1 + 4) {
+      error("Bad response");
+      return -1;
+    }
+    {
+      uint32_t size = 0;
+      memcpy(&size, data + 1, 4);
+      printf("size: %u\n", size);
+      if (len < 1 + 4 + size) {
+        error("Bad response");
+        return -1;
+      }
+
+      printf("(str)  %.*s\n", len, data + 5);
+      return 1 + 4 + size;
+    }
+  case TAG_INT:
+    if (len < 1 + 8) {
+      error("Bad response");
+      return -1;
+    }
+    {
+      int64_t val;
+      memcpy(&val, data + 1, 8);
+      printf("(int) %ld\n", val);
+      return 1 + 8;
+    }
+  case TAG_DBL:
+    if (len < 1 + 8) {
+      error("Bad response");
+      return -1;
+    }
+    {
+      double val;
+      memcpy(&val, data + 1, 8);
+      printf("(db) %g", val);
+      return 1 + 8;
+    }
+  case TAG_ARR:
+    if (len < 1 + 4) {
+      error("Bad response");
+      return -1;
+    }
+    {
+      uint32_t size;
+      memcpy(&size, data + 1, 4);
+      printf("(arr) len=%u\n", size);
+      size_t bytes = 1 + 4;
+      for (uint32_t i = 0; i < size; i++) {
+        int rv = print_res(data + bytes, size - bytes);
+        if (rv < 0) {
+          return rv;
+        }
+        bytes += (size_t)rv;
+      }
+      printf("(arr) end\n");
+      return (int32_t)bytes;
+    }
+  default:
+    error("Bad response");
+    return -1;
+  }
+}
 // reades into rbuf using read_full()
 // and handles endianess of len
 int read_res(int sockfd) {
@@ -129,15 +233,20 @@ int read_res(int sockfd) {
     error("read() error");
     return err;
   }
-  uint32_t rescode = 0;
-  if (len < 4) {
-    error("bad response");
+  err = print_res((uint8_t *)rbuf + 4, len);
+  /* uint32_t rescode = 0; */
+  /* if (len < 4) { */
+  /*   error("Bad response"); */
+  /*   return -1; */
+  /* } */
+  /* memcpy(&rescode, rbuf + 4, (size_t)4); */
+  /* printf("server says: [%u], %.*s\n", rescode, len - 4, rbuf + 8); */
+  if (err > 0 && (uint32_t)err != len) {
+    error("Bad response");
     return -1;
   }
-  memcpy(&rescode, rbuf + 4, (size_t)4);
-  printf("server says: [%u], %.*s\n", rescode, len - 4, rbuf + 8);
   free(rbuf);
-  return 0;
+  return err;
 }
 
 int main(int argc, char *argv[]) {

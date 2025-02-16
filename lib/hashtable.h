@@ -29,3 +29,6 @@ struct HashNode *hm_del(struct HashMap *hm, struct HashNode *key,
                         bool (*eq)(struct HashNode *, struct HashNode *));
 void hm_free(struct HashMap *hm);
 size_t hm_size(struct HashMap *hm);
+void hm_each(struct HashMap *hm, uint8_t **incoming, int *incoming_size,
+             int *incoming_cap,
+             bool (*f)(struct HashNode *, uint8_t **, int *, int *));

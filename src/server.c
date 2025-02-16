@@ -195,8 +195,94 @@ int parse_req(uint8_t *data, size_t len, char **out, int *out_size,
   }
   return 0;
 }
+// err code for TAG_ERR
+enum {
+  ERR_UNKNOWN = 1,
+  ERR_TOO_BIG = 2,
+};
+// tags for data types
+enum {
+  TAG_NIL = 0,
+  TAG_ERR = 1,
+  TAG_STR = 2,
+  TAG_INT = 3,
+  TAG_DBL = 4,
+  TAG_ARR = 5,
+};
+// append_buf functions for different data types
+void append_buf_u8(uint8_t **incoming, uint8_t data, int *incoming_size,
+                   int *incoming_capacity) {
+  append_buf(incoming, (uint8_t *)&data, 1, incoming_size, incoming_capacity);
+}
 
-// handling response status as an enum
+void append_buf_u32(uint8_t **incoming, uint32_t data, int *incoming_size,
+                    int *incoming_capacity) {
+  append_buf(incoming, (uint8_t *)&data, 4, incoming_size, incoming_capacity);
+}
+
+void append_buf_i64(uint8_t **incoming, int64_t data, int *incoming_size,
+                    int *incoming_capacity) {
+  append_buf(incoming, (uint8_t *)&data, 8, incoming_size, incoming_capacity);
+}
+
+void append_buf_dbl(uint8_t **incoming, double data, int *incoming_size,
+                    int *incoming_capacity) {
+  append_buf(incoming, (uint8_t *)&data, 8, incoming_size, incoming_capacity);
+}
+
+void out_nil(uint8_t **incoming, int *incoming_size, int *incoming_capacity) {
+  append_buf_u8(incoming, TAG_NIL, incoming_size, incoming_capacity);
+}
+
+void out_str(uint8_t **incoming, char *data, size_t size, int *incoming_size,
+             int *incoming_capacity) {
+  // add tag
+  append_buf_u8(incoming, TAG_STR, incoming_size, incoming_capacity);
+  // add len
+  append_buf_u32(incoming, (uint32_t)size, incoming_size, incoming_capacity);
+  // append str
+  append_buf(incoming, (uint8_t *)data, size, incoming_size, incoming_capacity);
+}
+
+void out_int(uint8_t **incoming, int64_t data, int *incoming_size,
+             int *incoming_capacity) {
+  // append tag
+  append_buf_u8(incoming, TAG_INT, incoming_size, incoming_capacity);
+  // append val
+  append_buf_i64(incoming, data, incoming_size, incoming_capacity);
+}
+
+void out_dbl(uint8_t **incoming, double data, int *incoming_size,
+             int *incoming_capacity) {
+  // append tag
+  append_buf_u8(incoming, TAG_DBL, incoming_size, incoming_capacity);
+  // append val
+  append_buf_dbl(incoming, data, incoming_size, incoming_capacity);
+}
+
+void out_err(uint8_t **incoming, int32_t code, char *msg, int *incoming_size,
+             int *incoming_capacity) {
+  // add tag
+  append_buf_u8(incoming, TAG_ERR, incoming_size, incoming_capacity);
+  // add code
+  append_buf_u32(incoming, code, incoming_size, incoming_capacity);
+  // add msg len
+  size_t len = strlen(msg);
+  append_buf_u32(incoming, len, incoming_size, incoming_capacity);
+  // add msg
+  append_buf(incoming, (uint8_t *)msg, len, incoming_size, incoming_capacity);
+}
+
+void out_arr(uint8_t **incoming, uint32_t n, int *incoming_size,
+             int *incoming_capacity) {
+  // add tag
+  append_buf_u8(incoming, TAG_ARR, incoming_size, incoming_capacity);
+  /* add len */
+  append_buf_u32(incoming, n, incoming_size, incoming_capacity);
+}
+
+// discard enum and Response
+//  handling response status as an enum
 enum {
   RES_OK = 0,
   RES_ERR = 1,
@@ -248,7 +334,8 @@ uint64_t str_hash(uint8_t *data, size_t len) {
 
 // get command handler for redis command `get`
 // reads the key in struct Entry* and looks up in the hashMap with key hashCode
-void do_get(char **cmd, struct Response *res) {
+void do_get(char **cmd, uint8_t **incoming, int *incoming_size,
+            int *incoming_capacity) {
   struct Entry key;
   if (cmd[1] != NULL) {
     key.key = cmd[1];
@@ -263,8 +350,7 @@ void do_get(char **cmd, struct Response *res) {
   if (!node) {
     printf("hey there");
     /* did not find the key  */
-    res->status = RES_NX;
-    return;
+    return out_nil(incoming, incoming_size, incoming_capacity);
   }
   struct Entry *x = container_of(node, struct Entry, node);
   // found the key
@@ -272,13 +358,13 @@ void do_get(char **cmd, struct Response *res) {
   size_t length = strlen(x->val);
   assert(length <= MAX_PAYLOAD_SIZE);
 
-  // prepares the response
-  memcpy(res->data, x->val, length);
-  res->data_size = length;
+  // prepares the response (str)
+  return out_str(incoming, x->val, length, incoming_size, incoming_capacity);
 }
 
 // set handler for redis command `set`
-void do_set(char **cmd) {
+void do_set(char **cmd, uint8_t **incoming, int *incoming_size,
+            int *incoming_capacity) {
   struct Entry key;
   if (cmd[1] != NULL) {
     key.key = cmd[1];
@@ -307,10 +393,14 @@ void do_set(char **cmd) {
     ent->val = strdup(cmd[2]);
     hm_insert(&g_data.db, &ent->node);
   }
+  char *msg = "OK";
+  size_t len = strlen(msg);
+  out_str(incoming, msg, len, incoming_size, incoming_capacity);
 }
 
 // del handler for redis command `del`
-void do_del(char **cmd, struct Response *res) {
+void do_del(char **cmd, uint8_t **incoming, int *incoming_size,
+            int *incoming_capacity) {
   struct Entry key;
   if (cmd[1] != NULL) {
     key.key = cmd[1];
@@ -329,38 +419,62 @@ void do_del(char **cmd, struct Response *res) {
     free(entry->key);
     free(entry->val);
     free(entry);
-  } else {
-    res->status = RES_NX;
   }
+  return out_int(incoming, node ? 1 : 0, incoming_size, incoming_capacity);
+}
+/* writes array of keys  */
+bool fn(struct HashNode *node, uint8_t **incoming, int *incoming_size,
+        int *incoming_capacity) {
+  struct Entry *entry = container_of(node, struct Entry, node);
+  char *key = entry->key;
+  size_t len = strlen(key);
+  out_str(incoming, key, len, incoming_size, incoming_capacity);
+  return true;
+}
+void do_keys(uint8_t **incoming, int *incoming_size, int *incoming_capacity) {
+  out_arr(incoming, hm_size(&g_data.db), incoming_size, incoming_capacity);
+  hm_each(&g_data.db, incoming, incoming_size, incoming_capacity, &fn);
 }
 
 // req handler
-void do_req(char **cmd, int *cmd_size, struct Response *res) {
+void do_req(char **cmd, int *cmd_size, uint8_t **incoming, int *incoming_size,
+            int *incoming_capacity) {
   if (*cmd_size == 2 && strcmp(cmd[0], "get") == 0) {
-    return do_get(cmd, res);
+    return do_get(cmd, incoming, incoming_size, incoming_capacity);
   } else if (*cmd_size == 3 && strcmp(cmd[0], "set") == 0) {
-    return do_set(cmd);
+    return do_set(cmd, incoming, incoming_size, incoming_capacity);
   } else if (*cmd_size == 2 && strcmp(cmd[0], "del") == 0) {
-    return do_del(cmd, res);
+    return do_del(cmd, incoming, incoming_size, incoming_capacity);
+  } else if (*cmd_size == 1 && strcmp(cmd[0], "keys") == 0) {
+    do_keys(incoming, incoming_size, incoming_capacity);
   } else {
-    res->status = RES_NX;
+    return out_nil(incoming, incoming_size, incoming_capacity);
   }
 }
 
-// function to prepare the response message
-void make_res(struct Response *resp, uint8_t **out, int *out_size,
-              int *out_cap) {
-  uint32_t res_len = 4 + (uint32_t)resp->data_size;
-  // length of the response
-  append_buf(out, (uint8_t *)&res_len, 4, out_size, out_cap);
-  // resp.status
-  append_buf(out, (uint8_t *)&(resp->status), 4, out_size, out_cap);
-  /* printf("%u\n", (*out)[4]); */
-  /* printf("%u\n", (*out)[5]); */
-  /* printf("%u\n", (*out)[6]); */
-  /* printf("%u\n", (*out)[7]); */
-  // resp.data (if any)
-  append_buf(out, resp->data, resp->data_size, out_size, out_cap);
+// reserves 4 bytes for pricipal header
+void response_begin(uint8_t **incoming, int *incoming_size,
+                    int *incoming_capacity, size_t *header) {
+  *header = *incoming_size;
+  append_buf_u32(incoming, 0, incoming_size, incoming_capacity);
+}
+// computes the size of the resp msg
+size_t response_size(int *incoming_size, size_t header) {
+  return (*incoming_size) - header - 4;
+}
+// checks whether the response is > MAX_PAYLOAD_SIZE
+// if it is so the rewrites the response as ERR_TOO_BIG
+void response_end(uint8_t **incoming, int *incoming_size,
+                  int *incoming_capacity, size_t header) {
+  size_t res_sz = response_size(incoming_size, header);
+  if (res_sz > MAX_PAYLOAD_SIZE) {
+    *incoming_size = header + 4;
+    out_err(incoming, ERR_TOO_BIG, "response too big", incoming_size,
+            incoming_capacity);
+    res_sz = response_size(incoming_size, header);
+  }
+  uint32_t sz = (uint32_t)res_sz;
+  memcpy(*incoming + header, &sz, 4);
 }
 // callback for accept
 // accept client connection
@@ -402,23 +516,17 @@ bool one_req(struct Conn *conn) {
     conn->want_close = true;
     return false;
   }
-  // Response init
-  struct Response resp = {0,
-                          (uint8_t *)malloc(MAX_PAYLOAD_SIZE * sizeof(uint8_t)),
-                          0, MAX_PAYLOAD_SIZE};
-  if (!resp.data) {
-    error("resp.data malloc failed");
-    free(cmd);
-    return false;
-  }
-  do_req(cmd, &cmd_size, &resp);
-  make_res(&resp, &conn->outgoing, &conn->outgoing_size,
-           &conn->outgoing_capacity);
-  free(resp.data);
-  for (size_t i = 0; i < cmd_size; i++) {
-    free(cmd[i]);
-  }
-  free(cmd);
+  size_t header_begin = 0;
+  response_begin(&conn->outgoing, &conn->outgoing_size,
+                 &conn->outgoing_capacity, &header_begin);
+  do_req(cmd, &cmd_size, &conn->outgoing, &conn->outgoing_size,
+         &conn->outgoing_capacity);
+  response_end(&conn->outgoing, &conn->outgoing_size, &conn->outgoing_capacity,
+               header_begin);
+  /* for (size_t i = 0; i < cmd_size; i++) { */
+  /*   free(cmd[i]); */
+  /* } */
+  /* free(cmd); */
   consume_buf(&conn->incoming, 4 + host_len, &conn->incoming_size,
               &conn->incoming_capacity);
   return true;

@@ -1,5 +1,6 @@
 #include "../lib/hashtable.h"
 #include <assert.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdlib.h>
 const size_t KEY_REHASHING_WORK = 128;
@@ -52,6 +53,19 @@ struct HashNode *ht_det(struct HashTable *ht, struct HashNode **from) {
   return toDel;
 }
 
+bool ht_each(struct HashTable *ht, uint8_t **incoming, int *incoming_size,
+             int *incoming_cap,
+             bool (*f)(struct HashNode *, uint8_t **, int *, int *)) {
+  for (size_t i = 0; ht->size != 0 && i <= ht->size; i++) {
+    for (struct HashNode *s = ht->tab[i]; s != NULL; s = s->next) {
+      if (!f(s, incoming, incoming_size, incoming_cap))
+        return false;
+    }
+  }
+  return true;
+}
+
+// shifts keys between older and newer
 void hm_help_rehashing(struct HashMap *hm) {
   size_t n = 0;
   while (n < KEY_REHASHING_WORK && hm->older.size > 0) {
@@ -128,3 +142,9 @@ void hm_free(struct HashMap *hm) {
 }
 
 size_t hm_size(struct HashMap *hm) { return hm->newer.size + hm->older.size; }
+void hm_each(struct HashMap *hm, uint8_t **incoming, int *incoming_size,
+             int *incoming_cap,
+             bool (*f)(struct HashNode *, uint8_t **, int *, int *)) {
+  ht_each(&hm->newer, incoming, incoming_size, incoming_cap, f) &&
+      ht_each(&hm->older, incoming, incoming_size, incoming_cap, f);
+}
