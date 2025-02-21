@@ -1,4 +1,4 @@
-# 🥕 Carrot
+# Carrot
 
 Carrot is a Redis-like key-value database that supports both basic KV operations and sorted sets. It implements a subset of Redis commands with a focus on simplicity and efficiency.
 
