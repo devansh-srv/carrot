@@ -4,4 +4,4 @@ Dockerfile.server
 Dockerfile.client
 docker-compose.yml
 debug.sh
-
+test.sh

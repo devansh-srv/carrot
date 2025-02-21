@@ -1,4 +1,6 @@
 #!/bin/bash
-gcc client.c -o client
+make clean
 mkdir build
+cd build
+cmake ..
 make

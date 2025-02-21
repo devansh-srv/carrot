@@ -2,6 +2,14 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
+void avl_init(struct AVLNode *node) {
+  node->left = node->right = node->parent = NULL;
+  node->height = 1;
+  node->cnt = 1;
+};
+
+uint32_t get_height(struct AVLNode *node) { return node ? node->height : 0; };
+uint32_t get_count(struct AVLNode *node) { return node ? node->cnt : 0; };
 uint32_t max(uint32_t a, uint32_t b) { return a < b ? a : b; }
 
 // helper function to update auxiliary data
@@ -145,6 +153,8 @@ struct AVLNode *avl_offset(struct AVLNode *node, int64_t offset) {
       } else {
         pos += 1 + get_count(node->right);
       }
+      node = parent;
     }
   }
+  return node;
 }

@@ -8,12 +8,15 @@
 /* // Add debug prints in key locations */
 /* DEBUG_PRINT("Connection received from %s:%d", inet_ntoa(client.sin_addr), */
 /*             ntohs(client.sin_port)); */
-#include "../lib/hashtable.h"
+/* #include "../lib/hashtable.h" */
+#include "../lib/utils.h"
+#include "../lib/zest.h"
 #include <arpa/inet.h>
 #include <asm-generic/socket.h>
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <poll.h>
@@ -29,10 +32,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
-
 // macro for finding the base pointer to struct
-#define container_of(ptr, type, member)                                        \
-  (type *)((char *)ptr - offsetof(type, member))
 
 /* const size_t MAX_PAYLOAD_SIZE = 4096; // scale this shit up */
 const size_t MAX_PAYLOAD_SIZE = 32 << 20;
@@ -199,6 +199,8 @@ int parse_req(uint8_t *data, size_t len, char **out, int *out_size,
 enum {
   ERR_UNKNOWN = 1,
   ERR_TOO_BIG = 2,
+  ERR_BAD_TYPE = 3,
+  ERR_BAD_ARG = 4,
 };
 // tags for data types
 enum {
@@ -208,6 +210,12 @@ enum {
   TAG_INT = 3,
   TAG_DBL = 4,
   TAG_ARR = 5,
+};
+// val types
+enum {
+  T_INIT = 0,
+  T_STR = 1,  // string
+  T_ZSET = 2, // sorted set
 };
 // append_buf functions for different data types
 void append_buf_u8(uint8_t **incoming, uint8_t data, int *incoming_size,
@@ -281,6 +289,18 @@ void out_arr(uint8_t **incoming, uint32_t n, int *incoming_size,
   append_buf_u32(incoming, n, incoming_size, incoming_capacity);
 }
 
+size_t out_arr_begin(uint8_t **incoming, int *incoming_size,
+                     int *incoming_capacity) {
+  append_buf_u8(incoming, TAG_ARR, incoming_size, incoming_capacity);
+  append_buf_u32(incoming, 0, incoming_size, incoming_capacity);
+  return (*incoming_size) - 4;
+}
+void out_arr_end(uint8_t **incoming, int *incoming_size, int *incoming_capacity,
+                 size_t cnt, uint32_t n) {
+  assert((*incoming)[cnt - 1] == TAG_ARR);
+  memcpy(*incoming + cnt, &n, 4);
+}
+
 // discard enum and Response
 //  handling response status as an enum
 enum {
@@ -305,9 +325,26 @@ struct {
 struct Entry {
   struct HashNode node;
   char *key;
+  uint32_t type;
   char *val;
+  struct Zset zset;
 };
 
+struct Entry *ent_init(uint32_t type) {
+  struct Entry *ent = (struct Entry *)malloc(sizeof(struct Entry));
+  ent->type = type;
+  return ent;
+}
+
+void ent_del(struct Entry *ent) {
+  if (ent->type == T_ZSET)
+    zset_clear(&ent->zset);
+  free(ent);
+}
+struct LookupKey {
+  struct HashNode node;
+  char *key;
+};
 // to check the equality of the keys using the container_of macro
 // the same function whose pointer is passed in the hashMap functions for
 // checking the inequality of nodes bool(*eq)(struct HashNode*a,struct HashNode*
@@ -324,13 +361,12 @@ bool entry_eq(struct HashNode *a, struct HashNode *b) {
 }
 
 // FNV hash because it is fast
-uint64_t str_hash(uint8_t *data, size_t len) {
-  uint32_t h = 0x811C9DC5;
-  for (size_t i = 0; i < len; i++) {
-    h = (h + data[i]) * 0x01000193;
-  }
-  return h;
-}
+/* uint64_t str_hash(uint8_t *data, size_t len) { uint32_t h = 0x811C9DC5; */
+/*   for (size_t i = 0; i < len; i++) { */
+/*     h = (h + data[i]) * 0x01000193; */
+/*   } */
+/*   return h; */
+/* } */
 
 // get command handler for redis command `get`
 // reads the key in struct Entry* and looks up in the hashMap with key hashCode
@@ -353,6 +389,9 @@ void do_get(char **cmd, uint8_t **incoming, int *incoming_size,
     return out_nil(incoming, incoming_size, incoming_capacity);
   }
   struct Entry *x = container_of(node, struct Entry, node);
+  if (x->type != T_STR)
+    return out_err(incoming, ERR_BAD_TYPE, "not a string type", incoming_size,
+                   incoming_capacity);
   // found the key
   // length of the response aka the val
   size_t length = strlen(x->val);
@@ -365,7 +404,7 @@ void do_get(char **cmd, uint8_t **incoming, int *incoming_size,
 // set handler for redis command `set`
 void do_set(char **cmd, uint8_t **incoming, int *incoming_size,
             int *incoming_capacity) {
-  struct Entry key;
+  struct LookupKey key;
   if (cmd[1] != NULL) {
     key.key = cmd[1];
   } else {
@@ -380,9 +419,13 @@ void do_set(char **cmd, uint8_t **incoming, int *incoming_size,
     // successfully found the node
     // uses base pointer to assign the val
     struct Entry *x = container_of(node, struct Entry, node);
+    if (x->type != T_STR) {
+      return out_err(incoming, ERR_BAD_TYPE, "not a string type", incoming_size,
+                     incoming_capacity);
+    }
     x->val = strdup(cmd[2]);
   } else {
-    struct Entry *ent = (struct Entry *)malloc(sizeof(struct Entry));
+    struct Entry *ent = ent_init(T_STR);
     if (!ent) {
       error("ent malloc failed");
       exit(EXIT_FAILURE);
@@ -401,7 +444,7 @@ void do_set(char **cmd, uint8_t **incoming, int *incoming_size,
 // del handler for redis command `del`
 void do_del(char **cmd, uint8_t **incoming, int *incoming_size,
             int *incoming_capacity) {
-  struct Entry key;
+  struct LookupKey key;
   if (cmd[1] != NULL) {
     key.key = cmd[1];
   } else {
@@ -416,9 +459,7 @@ void do_del(char **cmd, uint8_t **incoming, int *incoming_size,
     /* successfully deleted the node from hashMap */
     struct Entry *entry = container_of(node, struct Entry, node);
     /* prepares the response */
-    free(entry->key);
-    free(entry->val);
-    free(entry);
+    ent_del(entry);
   }
   return out_int(incoming, node ? 1 : 0, incoming_size, incoming_capacity);
 }
@@ -436,6 +477,131 @@ void do_keys(uint8_t **incoming, int *incoming_size, int *incoming_capacity) {
   hm_each(&g_data.db, incoming, incoming_size, incoming_capacity, &fn);
 }
 
+// typecasting functions
+bool str2dbl(char *msg, double *out) {
+  char *end = NULL;
+  *out = strtod(msg, &end);
+  return end == msg + strlen(msg) && !isnan(*out);
+}
+
+bool str2int(char *msg, int64_t *out) {
+  char *end = NULL;
+  *out = strtoll(msg, &end, 10);
+  return end == msg + strlen(msg);
+}
+// zadd handler function to add (score,name)
+void do_zadd(char **cmd, uint8_t **incoming, int *incoming_size,
+             int *incoming_capacity) {
+  double score = 0;
+  if (!str2dbl(cmd[2], &score))
+    return out_err(incoming, ERR_BAD_ARG, "expect float", incoming_size,
+                   incoming_capacity);
+  struct LookupKey key;
+  if (cmd[1] != NULL) {
+    key.key = cmd[1];
+  } else {
+    error("cmd[1] is NULL");
+    return;
+  }
+  key.node.hashCode = str_hash((uint8_t *)key.key, strlen(key.key));
+  struct HashNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  struct Entry *entry = NULL;
+  if (!node) {
+    entry = ent_init(T_ZSET);
+    entry->key = strdup(key.key);
+    entry->node.hashCode = key.node.hashCode;
+    hm_insert(&g_data.db, &entry->node);
+  } else {
+    entry = container_of(node, struct Entry, node);
+    if (entry->type != T_ZSET)
+      return out_err(incoming, ERR_BAD_TYPE, "expect zset", incoming_size,
+                     incoming_capacity);
+  }
+  char *name = cmd[3];
+  bool rv = zset_insert(&entry->zset, name, strlen(name), score);
+  return out_int(incoming, (int64_t)rv, incoming_size, incoming_capacity);
+}
+
+struct Zset empty_zset;
+struct Zset *expect_zset(char *msg) {
+  struct LookupKey key;
+  key.key = msg;
+  key.node.hashCode = str_hash((uint8_t *)key.key, strlen(key.key));
+  struct HashNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (!node) {
+    return (struct Zset *)&empty_zset;
+  }
+  struct Entry *ent = container_of(node, struct Entry, node);
+  return ent->type == T_ZSET ? &ent->zset : NULL;
+}
+
+void do_zrem(char **cmd, uint8_t **incoming, int *incoming_size,
+             int *incoming_capacity) {
+  struct Zset *zset = expect_zset(cmd[1]);
+  if (!zset)
+    return out_err(incoming, ERR_BAD_TYPE, "expected Zset", incoming_size,
+                   incoming_capacity);
+  char *name = cmd[2];
+  struct Znode *znode = zset_lookup(zset, name, strlen(name));
+  if (znode) {
+    zset_del(zset, znode);
+  }
+  return out_int(incoming, znode ? 1 : 0, incoming_size, incoming_capacity);
+}
+
+//
+// function for handling zscore
+void do_zscore(char **cmd, uint8_t **incoming, int *incoming_size,
+               int *incoming_capacity) {
+  struct Zset *zset = expect_zset(cmd[1]);
+  if (!zset)
+    return out_err(incoming, ERR_BAD_TYPE, "expect_zset", incoming_size,
+                   incoming_capacity);
+  char *name = cmd[2];
+  struct Znode *znode = zset_lookup(zset, name, strlen(name));
+  return znode
+             ? out_dbl(incoming, znode->score, incoming_size, incoming_capacity)
+             : out_nil(incoming, incoming_size, incoming_capacity);
+}
+
+// function to handle zquery
+void do_zquery(char **cmd, uint8_t **incoming, int *incoming_size,
+               int *incoming_capacity) {
+  double score = 0;
+  if (!str2dbl(cmd[2], &score)) {
+    return out_err(incoming, ERR_BAD_ARG, "expected a double", incoming_size,
+                   incoming_capacity);
+  }
+  char *name = cmd[3];
+  int64_t offset = 0, limit = 0;
+  if (!str2int(cmd[4], &offset) || !str2int(cmd[5], &limit)) {
+    return out_err(incoming, ERR_BAD_ARG, "expected int", incoming_size,
+                   incoming_capacity);
+  }
+  struct Zset *zset = expect_zset(cmd[1]);
+  if (!zset) {
+    return out_err(incoming, ERR_BAD_TYPE, "expect_zset", incoming_size,
+                   incoming_capacity);
+  }
+  if (limit <= 0)
+    return out_arr(incoming, 0, incoming_size, incoming_capacity);
+  struct Znode *znode = zset_seek(zset, name, strlen(name), score);
+  /* if (!znode) { */
+  /*   error("haha idiot\n"); */
+  /*   exit(EXIT_FAILURE); */
+  /* } */
+  znode = znode_offset(znode, offset);
+  size_t cnt = out_arr_begin(incoming, incoming_size, incoming_capacity);
+  int64_t n = 0;
+  while (znode && n < limit) {
+    out_str(incoming, znode->name, znode->len, incoming_size,
+            incoming_capacity);
+    out_dbl(incoming, znode->score, incoming_size, incoming_capacity);
+    znode = znode_offset(znode, offset + 1);
+    n += 2;
+  }
+  out_arr_end(incoming, incoming_size, incoming_capacity, cnt, (uint32_t)n);
+}
 // req handler
 void do_req(char **cmd, int *cmd_size, uint8_t **incoming, int *incoming_size,
             int *incoming_capacity) {
@@ -447,8 +613,17 @@ void do_req(char **cmd, int *cmd_size, uint8_t **incoming, int *incoming_size,
     return do_del(cmd, incoming, incoming_size, incoming_capacity);
   } else if (*cmd_size == 1 && strcmp(cmd[0], "keys") == 0) {
     do_keys(incoming, incoming_size, incoming_capacity);
+  } else if (*cmd_size == 4 && strcmp(cmd[0], "zadd") == 0) {
+    return do_zadd(cmd, incoming, incoming_size, incoming_capacity);
+  } else if (*cmd_size == 3 && strcmp(cmd[0], "zrem") == 0) {
+    return do_zrem(cmd, incoming, incoming_size, incoming_capacity);
+  } else if (*cmd_size == 3 && strcmp(cmd[0], "zscore") == 0) {
+    return do_zscore(cmd, incoming, incoming_size, incoming_capacity);
+  } else if (*cmd_size == 6 && strcmp(cmd[0], "zquery") == 0) {
+    return do_zquery(cmd, incoming, incoming_size, incoming_capacity);
   } else {
-    return out_nil(incoming, incoming_size, incoming_capacity);
+    return out_err(incoming, ERR_UNKNOWN, "unknown command", incoming_size,
+                   incoming_capacity);
   }
 }
 
@@ -537,10 +712,10 @@ struct Conn *handle_accept(int fd) {
   struct sockaddr_in client;
   socklen_t clilen = sizeof(client);
   errno = 0;
-  int sockfd = -1;
-  do {
-    sockfd = accept(fd, (struct sockaddr *)&client, &clilen);
-  } while (sockfd <= 0 && errno == EAGAIN);
+  int sockfd = accept(fd, (struct sockaddr *)&client, &clilen);
+  /* do { */
+  /*   sockfd = accept(fd, (struct sockaddr *)&client, &clilen); */
+  /* } while (sockfd <= 0 && errno == EAGAIN); */
 
   uint32_t ip = client.sin_addr.s_addr;
   fprintf(stderr, "client_addr: %d.%d.%d.%d:%d\n", ip & 255, (ip >> 8) & 255,

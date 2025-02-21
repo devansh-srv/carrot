@@ -10,19 +10,10 @@ struct AVLNode {
   uint32_t cnt;
 };
 
-inline void avl_init(struct AVLNode *node) {
-  node->left = node->right = node->parent = NULL;
-  node->height = 1;
-  node->cnt = 1;
-};
+void avl_init(struct AVLNode *node);
 
-inline uint32_t get_height(struct AVLNode *node) {
-  return node ? node->height : 0;
-};
-inline uint32_t get_count(struct AVLNode *node) {
-
-  return node ? node->cnt : 0;
-};
+uint32_t get_height(struct AVLNode *node);
+uint32_t get_count(struct AVLNode *node);
 
 struct AVLNode *avl_fix(struct AVLNode *node);
 struct AVLNode *avl_del(struct AVLNode *node);
