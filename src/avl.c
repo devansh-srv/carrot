@@ -158,3 +158,15 @@ struct AVLNode *avl_offset(struct AVLNode *node, int64_t offset) {
   }
   return node;
 }
+int64_t avl_rank(struct AVLNode *node) {
+  int64_t rank = 1 + get_count(node->left);
+  struct AVLNode *parent = node->parent;
+  while (parent) {
+    if (parent->right == node) {
+      rank += 1 + get_count(parent->left);
+    }
+    node = parent;
+    parent = node->parent;
+  }
+  return rank;
+}

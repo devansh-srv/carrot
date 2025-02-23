@@ -98,7 +98,12 @@ Example:
 ./client localhost 6379 zscore myset element1
 ```
 
-4. **ZQUERY** - Query elements in a sorted set
+4. **ZRANK** - Get the rank of an element
+```bash
+./client localhost 6379 zrank myset element1
+```
+
+5. **ZQUERY** - Query elements in a sorted set
 ```bash
 ./client localhost 6379 zquery myset 1.0 "" 0 10
 ```
@@ -108,6 +113,7 @@ Parameters:
 - `name`: Minimum element name to start from
 - `offset`: Number of elements to skip
 - `limit`: Maximum number of elements to return
+
 
 ## Technical Details
 

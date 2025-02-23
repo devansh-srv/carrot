@@ -2,6 +2,7 @@
 #include "../lib/zest.h"
 #include <assert.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -139,6 +140,11 @@ struct Znode *zset_seek(struct Zset *zset, char *name, size_t len,
 struct Znode *znode_offset(struct Znode *znode, int64_t offset) {
   struct AVLNode *found = znode ? avl_offset(&znode->tree, offset) : NULL;
   return found ? container_of(found, struct Znode, tree) : NULL;
+}
+// return the rank of the node
+int64_t znode_rank(struct Znode *znode) {
+  return znode ? avl_rank(&znode->tree) : 0;
+  /* return found ? container_of(found, struct Znode, tree) : NULL; */
 }
 
 // helps in cleaning the tree memory by disposing the left and right subtrees

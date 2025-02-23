@@ -18,3 +18,4 @@ uint32_t get_count(struct AVLNode *node);
 struct AVLNode *avl_fix(struct AVLNode *node);
 struct AVLNode *avl_del(struct AVLNode *node);
 struct AVLNode *avl_offset(struct AVLNode *node, int64_t offset);
+int64_t avl_rank(struct AVLNode *node);

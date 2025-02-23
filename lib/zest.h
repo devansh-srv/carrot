@@ -23,3 +23,4 @@ struct Znode *zset_seek(struct Zset *zset, char *name, size_t len,
                         double score);
 void zset_clear(struct Zset *zset);
 struct Znode *znode_offset(struct Znode *znode, int64_t offset);
+int64_t znode_rank(struct Znode *znode);

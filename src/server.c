@@ -602,6 +602,19 @@ void do_zquery(char **cmd, uint8_t **incoming, int *incoming_size,
   }
   out_arr_end(incoming, incoming_size, incoming_capacity, cnt, (uint32_t)n);
 }
+// function for handling zscore
+void do_zrank(char **cmd, uint8_t **incoming, int *incoming_size,
+              int *incoming_capacity) {
+  struct Zset *zset = expect_zset(cmd[1]);
+  if (!zset)
+    return out_err(incoming, ERR_BAD_TYPE, "expect_zset", incoming_size,
+                   incoming_capacity);
+  char *name = cmd[2];
+  struct Znode *znode = zset_lookup(zset, name, strlen(name));
+  int64_t rank = znode_rank(znode);
+  return rank != 0 ? out_int(incoming, rank, incoming_size, incoming_capacity)
+                   : out_nil(incoming, incoming_size, incoming_capacity);
+}
 // req handler
 void do_req(char **cmd, int *cmd_size, uint8_t **incoming, int *incoming_size,
             int *incoming_capacity) {
@@ -621,6 +634,8 @@ void do_req(char **cmd, int *cmd_size, uint8_t **incoming, int *incoming_size,
     return do_zscore(cmd, incoming, incoming_size, incoming_capacity);
   } else if (*cmd_size == 6 && strcmp(cmd[0], "zquery") == 0) {
     return do_zquery(cmd, incoming, incoming_size, incoming_capacity);
+  } else if (*cmd_size == 3 && strcmp(cmd[0], "zrank") == 0) {
+    return do_zrank(cmd, incoming, incoming_size, incoming_capacity);
   } else {
     return out_err(incoming, ERR_UNKNOWN, "unknown command", incoming_size,
                    incoming_capacity);
