@@ -114,6 +114,16 @@ Parameters:
 - `offset`: Number of elements to skip
 - `limit`: Maximum number of elements to return
 
+6. **PEXPIRE** - Set the ttl value for any key in msec
+```bash
+./client localhost 6379 pexpire myset 1000 
+```
+
+7. **PTTL** - Get the ttl for any key 
+```bash
+./client localhost 6379 pttl myset
+```
+
 
 ## Technical Details
 

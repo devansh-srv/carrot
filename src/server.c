@@ -9,6 +9,8 @@
 /* DEBUG_PRINT("Connection received from %s:%d", inet_ntoa(client.sin_addr), */
 /*             ntohs(client.sin_port)); */
 /* #include "../lib/hashtable.h" */
+#include "../lib/heap.h"
+#include "../lib/list.h"
 #include "../lib/utils.h"
 #include "../lib/zest.h"
 #include <arpa/inet.h>
@@ -31,18 +33,26 @@
 #include <sys/poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 // macro for finding the base pointer to struct
 
 /* const size_t MAX_PAYLOAD_SIZE = 4096; // scale this shit up */
+const uint64_t IDLE_TIMEOUT_MS = 5 * 1000;
 const size_t MAX_PAYLOAD_SIZE = 32 << 20;
 const size_t MAX_ARGS = 200 * 1000;
-
+const size_t MAX_WORKS = 2000;
 void error(const char *msg) { perror(msg); }
 void errno_msg(const char *msg) {
   fprintf(stderr, "errno: %d, error: %s", errno, msg);
 }
 
+// monotonic clock
+uint64_t get_monotime() {
+  struct timespec res = {0, 0};
+  clock_gettime(CLOCK_MONOTONIC, &res);
+  return (uint64_t)(res.tv_sec) * 1000 + res.tv_nsec / 1000 / 1000;
+}
 // we need non blocking sockets
 void nonB(int fd) {
   errno = 0;
@@ -71,6 +81,8 @@ struct Conn {
   uint8_t *outgoing;
   int outgoing_size;
   int outgoing_capacity;
+  uint64_t last_active_ms;
+  struct DList dummy;
 };
 
 void append_buf(uint8_t **incoming, uint8_t *data, size_t len,
@@ -320,11 +332,22 @@ struct Response {
 // global declaration and init of the hashMap db
 struct {
   struct HashMap db;
+  // mapping connections fd(s)
+  struct Conn **fdconn;
+  size_t fdconn_cap;
+  size_t fdconn_size;
+  // timers for idle connections
+  struct DList dummy;
+  struct HeapItem *heap;
+  size_t heap_size;
+  size_t heap_cap;
+
 } g_data;
 
 struct Entry {
   struct HashNode node;
   char *key;
+  size_t heap_idx;
   uint32_t type;
   char *val;
   struct Zset zset;
@@ -333,12 +356,14 @@ struct Entry {
 struct Entry *ent_init(uint32_t type) {
   struct Entry *ent = (struct Entry *)malloc(sizeof(struct Entry));
   ent->type = type;
+  ent->heap_idx = (size_t)-1;
   return ent;
 }
-
+void entry_set_ttl(struct Entry *ent, int64_t ttl_ms);
 void ent_del(struct Entry *ent) {
   if (ent->type == T_ZSET)
     zset_clear(&ent->zset);
+  entry_set_ttl(ent, -1);
   free(ent);
 }
 struct LookupKey {
@@ -359,14 +384,6 @@ bool entry_eq(struct HashNode *a, struct HashNode *b) {
     return true;
   return false;
 }
-
-// FNV hash because it is fast
-/* uint64_t str_hash(uint8_t *data, size_t len) { uint32_t h = 0x811C9DC5; */
-/*   for (size_t i = 0; i < len; i++) { */
-/*     h = (h + data[i]) * 0x01000193; */
-/*   } */
-/*   return h; */
-/* } */
 
 // get command handler for redis command `get`
 // reads the key in struct Entry* and looks up in the hashMap with key hashCode
@@ -463,6 +480,51 @@ void do_del(char **cmd, uint8_t **incoming, int *incoming_size,
   }
   return out_int(incoming, node ? 1 : 0, incoming_size, incoming_capacity);
 }
+
+void heap_delete(struct HeapItem *a, size_t pos, size_t *heap_size,
+                 size_t *heap_cap) {
+  *(a + pos) = *(a + (*heap_size - 1));
+  *heap_size -= 1;
+  if (pos < *heap_size) {
+    heap_update(a, pos, *heap_size);
+  }
+}
+
+void heap_upsert(struct HeapItem **a, size_t pos, struct HeapItem t,
+                 size_t *heap_size, size_t *heap_cap) {
+  if (pos < *heap_size) {
+    memcpy(a + pos, &t, sizeof(struct HeapItem));
+  } else {
+    size_t new_cap = ((*heap_cap) * 2);
+    struct HeapItem *tmp =
+        (struct HeapItem *)realloc(*a, new_cap * sizeof(struct HeapItem));
+    if (!tmp) {
+      error("heap realloc failed at 500 something");
+      exit(EXIT_FAILURE);
+    }
+    *a = tmp;
+    *heap_cap = new_cap;
+    pos = *heap_size;
+    (*a)[*heap_size] = t;
+    /* if (t.ref) */
+    /*   *(size_t *)(t.ref) = *heap_size; */
+    *heap_size = *heap_size + (size_t)1;
+  }
+  heap_update(*a, pos, *heap_size);
+}
+
+void entry_set_ttl(struct Entry *entry, int64_t ttl_ms) {
+  if (ttl_ms < 0 && entry->heap_idx != (size_t)-1) {
+    heap_delete(g_data.heap, entry->heap_idx, &g_data.heap_size,
+                &g_data.heap_cap);
+    entry->heap_idx = -1;
+  } else if (ttl_ms >= 0) {
+    uint64_t expire_at = get_monotime() + (uint64_t)ttl_ms;
+    struct HeapItem item = {expire_at, &entry->heap_idx};
+    heap_upsert(&g_data.heap, entry->heap_idx, item, &g_data.heap_size,
+                &g_data.heap_cap);
+  }
+}
 /* writes array of keys  */
 bool fn(struct HashNode *node, uint8_t **incoming, int *incoming_size,
         int *incoming_capacity) {
@@ -476,7 +538,6 @@ void do_keys(uint8_t **incoming, int *incoming_size, int *incoming_capacity) {
   out_arr(incoming, hm_size(&g_data.db), incoming_size, incoming_capacity);
   hm_each(&g_data.db, incoming, incoming_size, incoming_capacity, &fn);
 }
-
 // typecasting functions
 bool str2dbl(char *msg, double *out) {
   char *end = NULL;
@@ -488,6 +549,46 @@ bool str2int(char *msg, int64_t *out) {
   char *end = NULL;
   *out = strtoll(msg, &end, 10);
   return end == msg + strlen(msg);
+}
+// pexpire handler
+void do_expire(char **cmd, uint8_t **incoming, int *incoming_size,
+               int *incoming_capacity) {
+  int64_t ttl_ms = 0;
+  if (!str2int(cmd[2], &ttl_ms)) {
+    return out_err(incoming, ERR_BAD_ARG, "expected int", incoming_size,
+                   incoming_capacity);
+  }
+  struct LookupKey key;
+  key.key = cmd[1];
+  key.node.hashCode = str_hash((uint8_t *)key.key, strlen(key.key));
+  struct HashNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (node) {
+    struct Entry *entry = container_of(node, struct Entry, node);
+    entry_set_ttl(entry, ttl_ms);
+  }
+  return out_int(incoming, node ? 1 : 0, incoming_size, incoming_capacity);
+}
+
+// pttl handeler
+void do_ttl(char **cmd, uint8_t **incoming, int *incoming_size,
+            int *incoming_capacity) {
+  struct LookupKey key;
+  key.key = cmd[1];
+  key.node.hashCode = str_hash((uint8_t *)key.key, strlen(key.key));
+  struct HashNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+  if (!node) {
+    return out_int(incoming, -2, incoming_size, incoming_capacity);
+  }
+
+  struct Entry *entry = container_of(node, struct Entry, node);
+  if (entry->heap_idx == (size_t)-1) {
+    return out_int(incoming, -1, incoming_size, incoming_capacity);
+  }
+  struct HeapItem *expire_st = g_data.heap + entry->heap_idx;
+  uint64_t expire = expire_st->val;
+  uint64_t now = get_monotime();
+  return out_int(incoming, expire > now ? (expire - now) : 0, incoming_size,
+                 incoming_capacity);
 }
 // zadd handler function to add (score,name)
 void do_zadd(char **cmd, uint8_t **incoming, int *incoming_size,
@@ -624,8 +725,12 @@ void do_req(char **cmd, int *cmd_size, uint8_t **incoming, int *incoming_size,
     return do_set(cmd, incoming, incoming_size, incoming_capacity);
   } else if (*cmd_size == 2 && strcmp(cmd[0], "del") == 0) {
     return do_del(cmd, incoming, incoming_size, incoming_capacity);
+  } else if (*cmd_size == 3 && strcmp(cmd[0], "pexpire") == 0) {
+    return do_expire(cmd, incoming, incoming_size, incoming_capacity);
+  } else if (*cmd_size == 2 && strcmp(cmd[0], "pttl") == 0) {
+    return do_ttl(cmd, incoming, incoming_size, incoming_capacity);
   } else if (*cmd_size == 1 && strcmp(cmd[0], "keys") == 0) {
-    do_keys(incoming, incoming_size, incoming_capacity);
+    return do_keys(incoming, incoming_size, incoming_capacity);
   } else if (*cmd_size == 4 && strcmp(cmd[0], "zadd") == 0) {
     return do_zadd(cmd, incoming, incoming_size, incoming_capacity);
   } else if (*cmd_size == 3 && strcmp(cmd[0], "zrem") == 0) {
@@ -713,17 +818,17 @@ bool one_req(struct Conn *conn) {
          &conn->outgoing_capacity);
   response_end(&conn->outgoing, &conn->outgoing_size, &conn->outgoing_capacity,
                header_begin);
-  /* for (size_t i = 0; i < cmd_size; i++) { */
-  /*   free(cmd[i]); */
-  /* } */
-  /* free(cmd); */
+  for (size_t i = 0; i < cmd_size; i++) {
+    free(cmd[i]);
+  }
+  free(cmd);
   consume_buf(&conn->incoming, 4 + host_len, &conn->incoming_size,
               &conn->incoming_capacity);
   return true;
 }
 
 // handle for accepting connections
-struct Conn *handle_accept(int fd) {
+int32_t handle_accept(int fd) {
   struct sockaddr_in client;
   socklen_t clilen = sizeof(client);
   errno = 0;
@@ -748,7 +853,32 @@ struct Conn *handle_accept(int fd) {
   conn->outgoing_size = 0;
   conn->incoming_capacity = 8;
   conn->outgoing_capacity = 8;
+  conn->last_active_ms = get_monotime();
+  dlist_insert(&g_data.dummy, &conn->dummy);
 
+  /* struct Conn **fdconn = (struct Conn **)calloc(8, sizeof(struct Conn *)); */
+  /* if (fdconn == NULL) { */
+  /*   error("fdconn error"); */
+  /*   exit(0); */
+  /* } */
+  /* size_t fdconn_cap = 8; */
+
+  /* struct Conn *conn = handle_accept(fd); */
+  if (conn && conn->fd >= 0) {
+    if (g_data.fdconn_cap < (size_t)conn->fd + 1) {
+      int new_cap = (size_t)conn->fd + 1;
+      struct Conn **tmp = (struct Conn **)realloc(
+          g_data.fdconn, (size_t)new_cap * sizeof(struct Conn *));
+      if (tmp == NULL) {
+        error("fdconn realloc()");
+        exit(0);
+      }
+      g_data.fdconn = tmp;
+      g_data.fdconn_cap = new_cap;
+    }
+    assert(!g_data.fdconn[conn->fd]);
+    g_data.fdconn[conn->fd] = conn;
+  }
   // need to check malloc idiot
   if (conn->incoming == NULL || conn->outgoing == NULL) {
     error("memory not available for incoming and outgoing");
@@ -757,9 +887,18 @@ struct Conn *handle_accept(int fd) {
     free(conn);
     close(sockfd);
 
-    return NULL;
+    return -1;
   }
-  return conn;
+  return 0;
+}
+
+void conn_destroy(struct Conn *conn) {
+  close(conn->fd);
+  g_data.fdconn[conn->fd] = NULL;
+  dlist_detatch(&conn->dummy);
+  free(conn->incoming);
+  free(conn->outgoing);
+  free(conn);
 }
 // callback for write
 // writes data from connection state conn outgoing to kernel buffer
@@ -826,8 +965,64 @@ void handle_read(struct Conn *conn) {
     return handle_write(conn);
   }
 }
+int32_t next_timer() {
+  uint64_t now = get_monotime();
+  uint64_t next = (uint64_t)-1;
+  if (!dlist_empty(&g_data.dummy)) {
+    struct Conn *conn = container_of(g_data.dummy.next, struct Conn, dummy);
+    next = conn->last_active_ms + IDLE_TIMEOUT_MS;
+  }
+  if (g_data.heap_size != 0 && g_data.heap[0].val < next) {
+    next = g_data.heap[0].val;
+  }
+  if (next == (uint64_t)-1) {
+    return -1;
+  }
+  if (next <= now) {
+    return 0;
+  }
+  return (int32_t)(next - now);
+}
+
+bool hnode_same(struct HashNode *a, struct HashNode *b) { return a == b; }
+void process_timers() {
+  uint64_t now = get_monotime();
+  while (!dlist_empty(&g_data.dummy)) {
+    struct Conn *conn = container_of(g_data.dummy.next, struct Conn, dummy);
+    uint64_t next = conn->last_active_ms + IDLE_TIMEOUT_MS;
+    if (next >= now)
+      break;
+    fprintf(stderr, "removing idle connection%d\n", conn->fd);
+    conn_destroy(conn);
+  }
+  size_t nworks = 0;
+  while (g_data.heap_size != 0 && g_data.heap[0].val < now) {
+    struct Entry *entry =
+        container_of(g_data.heap[0].ref, struct Entry, heap_idx);
+    struct HashNode *node = hm_del(&g_data.db, &entry->node, &hnode_same);
+    assert(node == &entry->node);
+    ent_del(entry);
+    if (nworks++ >= MAX_WORKS)
+      break;
+  }
+}
 
 int main(int argc, char *argv[]) {
+  dlist_init(&g_data.dummy);
+  g_data.fdconn = (struct Conn **)calloc(8, sizeof(struct Conn *));
+  if (g_data.fdconn == NULL) {
+    error("fdconn error");
+    exit(0);
+  }
+  g_data.fdconn_cap = 8;
+  g_data.fdconn_size = 0;
+  g_data.heap = (struct HeapItem *)calloc(8, sizeof(struct HeapItem));
+  if (g_data.heap == NULL) {
+    error("HeapItem error");
+    exit(EXIT_FAILURE);
+  }
+  g_data.heap_size = 0;
+  g_data.heap_cap = 8;
   int fd;
   struct sockaddr_in server;
   bzero(&server, sizeof(server));
@@ -853,12 +1048,12 @@ int main(int argc, char *argv[]) {
     exit(0);
   }
 
-  struct Conn **fdconn = (struct Conn **)calloc(8, sizeof(struct Conn *));
-  if (fdconn == NULL) {
-    error("fdconn error");
-    exit(0);
-  }
-  size_t fdconn_cap = 8;
+  /* struct Conn **fdconn = (struct Conn **)calloc(8, sizeof(struct Conn *)); */
+  /* if (fdconn == NULL) { */
+  /*   error("fdconn error"); */
+  /*   exit(0); */
+  /* } */
+  /* size_t fdconn_cap = 8; */
   struct pollfd *poll_args = (struct pollfd *)calloc(8, sizeof(struct pollfd));
   if (poll_args == NULL) {
     error("pollfd error");
@@ -872,8 +1067,8 @@ int main(int argc, char *argv[]) {
     struct pollfd pfd = {fd, POLL_IN, 0};
     memcpy(&poll_args[poll_args_size], &pfd, sizeof(pfd));
     poll_args_size += 1;
-    for (int i = 0; i < (int)fdconn_cap; i++) {
-      struct Conn *conn = fdconn[i];
+    for (int i = 0; i < (int)g_data.fdconn_cap; i++) {
+      struct Conn *conn = g_data.fdconn[i];
       if (!conn) {
         continue;
       }
@@ -899,7 +1094,9 @@ int main(int argc, char *argv[]) {
       memcpy(&poll_args[poll_args_size], &pfd, sizeof(pfd));
       poll_args_size += 1;
     }
-    int err = poll(poll_args, (nfds_t)poll_args_size, -1);
+    int32_t timeout = next_timer();
+    int err = poll(poll_args, (nfds_t)poll_args_size, timeout);
+    process_timers();
     if (err < 0 && errno == EAGAIN) {
       continue;
     }
@@ -908,25 +1105,7 @@ int main(int argc, char *argv[]) {
       exit(0);
     }
     if (poll_args[0].revents) {
-      struct Conn *conn = handle_accept(fd);
-      if (conn && conn->fd >= 0) {
-        if (fdconn_cap < (size_t)conn->fd + 1) {
-          int new_cap = (size_t)conn->fd + 1;
-          struct Conn **tmp = (struct Conn **)realloc(
-              fdconn, (size_t)new_cap * sizeof(struct Conn *));
-          if (tmp == NULL) {
-            error("fdconn realloc()");
-            exit(0);
-          }
-          /* for (size_t i = fdconn_cap; i < (size_t)new_cap; i++) { */
-          /*   tmp[i] = NULL; */
-          /* } */
-          fdconn = tmp;
-          fdconn_cap = new_cap;
-        }
-        assert(!fdconn[conn->fd]);
-        fdconn[conn->fd] = conn;
-      }
+      handle_accept(fd);
     }
     for (int i = 1; i < poll_args_size; i++) {
       short ready = poll_args[i].revents;
@@ -938,11 +1117,11 @@ int main(int argc, char *argv[]) {
         errno_msg("poll args[i].fd: ");
         fprintf(stderr, "%d", fd);
       }
-      if ((size_t)fd >= fdconn_cap) {
+      if ((size_t)fd >= g_data.fdconn_cap) {
         error("mapping issue");
         continue;
       }
-      struct Conn *conn = fdconn[fd];
+      struct Conn *conn = g_data.fdconn[fd];
       if (conn == NULL) {
         error("conn is NULL");
         exit(EXIT_FAILURE);
@@ -958,11 +1137,7 @@ int main(int argc, char *argv[]) {
       }
       if ((ready & POLLERR) || conn->want_close) {
 
-        close(conn->fd);
-        free(conn->incoming);
-        free(conn->outgoing);
-        fdconn[conn->fd] = NULL;
-        free(conn);
+        conn_destroy(conn);
       }
     }
   }
