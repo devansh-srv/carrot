@@ -82,6 +82,8 @@ struct Conn {
   int outgoing_size;
   int outgoing_capacity;
   uint64_t last_active_ms;
+  // dummy is the node to be put in linked list to keep track of active and
+  // stale conn
   struct DList dummy;
 };
 
@@ -336,8 +338,10 @@ struct {
   struct Conn **fdconn;
   size_t fdconn_cap;
   size_t fdconn_size;
-  // timers for idle connections
+  // timers for idle connections linked list head
   struct DList dummy;
+  /* heap array */
+  // for ttl
   struct HeapItem *heap;
   size_t heap_size;
   size_t heap_cap;
@@ -489,12 +493,14 @@ void heap_delete(struct HeapItem *a, size_t pos, size_t *heap_size,
     heap_update(a, pos, *heap_size);
   }
 }
-
+// add the HeapItem to the heap array
 void heap_upsert(struct HeapItem **a, size_t pos, struct HeapItem t,
                  size_t *heap_size, size_t *heap_cap) {
   if (pos < *heap_size) {
-    memcpy(a + pos, &t, sizeof(struct HeapItem));
+    // update to the array
+    (*a)[pos] = t;
   } else {
+    // dynamically realloc to accomodate
     size_t new_cap = ((*heap_cap) * 2);
     struct HeapItem *tmp =
         (struct HeapItem *)realloc(*a, new_cap * sizeof(struct HeapItem));
@@ -512,13 +518,16 @@ void heap_upsert(struct HeapItem **a, size_t pos, struct HeapItem t,
   }
   heap_update(*a, pos, *heap_size);
 }
-
+// function for setting the ttl val
 void entry_set_ttl(struct Entry *entry, int64_t ttl_ms) {
+  // if negative ttl_ms delete from Heap right now
   if (ttl_ms < 0 && entry->heap_idx != (size_t)-1) {
     heap_delete(g_data.heap, entry->heap_idx, &g_data.heap_size,
                 &g_data.heap_cap);
     entry->heap_idx = -1;
   } else if (ttl_ms >= 0) {
+    // sets the time when it has to be deleted
+    // monotime (now) +  time to live
     uint64_t expire_at = get_monotime() + (uint64_t)ttl_ms;
     struct HeapItem item = {expire_at, &entry->heap_idx};
     heap_upsert(&g_data.heap, entry->heap_idx, item, &g_data.heap_size,
@@ -635,7 +644,7 @@ struct Zset *expect_zset(char *msg) {
   struct Entry *ent = container_of(node, struct Entry, node);
   return ent->type == T_ZSET ? &ent->zset : NULL;
 }
-
+// removing the sorted set type
 void do_zrem(char **cmd, uint8_t **incoming, int *incoming_size,
              int *incoming_capacity) {
   struct Zset *zset = expect_zset(cmd[1]);
@@ -965,6 +974,7 @@ void handle_read(struct Conn *conn) {
     return handle_write(conn);
   }
 }
+// function to get the next_timer
 int32_t next_timer() {
   uint64_t now = get_monotime();
   uint64_t next = (uint64_t)-1;
@@ -984,7 +994,10 @@ int32_t next_timer() {
   return (int32_t)(next - now);
 }
 
+// cmp function for process_timers()
 bool hnode_same(struct HashNode *a, struct HashNode *b) { return a == b; }
+
+// eradicating stale timers from the heap/linked list
 void process_timers() {
   uint64_t now = get_monotime();
   while (!dlist_empty(&g_data.dummy)) {
