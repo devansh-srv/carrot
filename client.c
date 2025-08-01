@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#define PORT 12345
 // payload size
 const size_t MAX_PAYLOAD_SIZE = 32 << 20;
 /* const size_t MAX_PAYLOAD_SIZE = 4096; */
@@ -251,8 +252,8 @@ int read_res(int sockfd) {
 
 int main(int argc, char *argv[]) {
   int sock, n;
-  if (argc < 3)
-    error("hostname and port no.");
+  if (argc < 2)
+    error("hostname not specified");
   sock = socket(PF_INET, SOCK_STREAM, 0);
   if (sock < 0)
     error("socket()");
@@ -265,7 +266,7 @@ int main(int argc, char *argv[]) {
     error("No such host");
   }
   server.sin_family = AF_INET;
-  server.sin_port = htons(atoi(argv[2]));
+  server.sin_port = htons(PORT);
   bcopy((const void *)s->h_addr, (void *)&server.sin_addr.s_addr,
         s->h_length); // we need to copy the addr
 
@@ -273,7 +274,7 @@ int main(int argc, char *argv[]) {
     error("connect()");
     exit(EXIT_FAILURE);
   }
-  size_t query_sz = argc - 3;
+  size_t query_sz = argc - 2;
   char **query =
       (char **)calloc(query_sz, sizeof(char *)); // structure queries for server
 
@@ -283,7 +284,7 @@ int main(int argc, char *argv[]) {
   }
   int query_size = 0;
   for (int i = 0; i < query_sz; i++) {
-    query[i] = strdup(argv[i + 3]);
+    query[i] = strdup(argv[i + 2]);
     query_size++;
   }
 

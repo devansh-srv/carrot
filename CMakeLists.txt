@@ -4,6 +4,7 @@ project(Carrot)
 # Set the C standard
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED True)
+# set(CMAKE_EXE_LINKER_FLAGS "-static")
 
 # Set build directories
 set(BUILD_DIR ${CMAKE_BINARY_DIR})
