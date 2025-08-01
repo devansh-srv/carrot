@@ -35,6 +35,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#define PORT 12345
 // macro for finding the base pointer to struct
 
 /* const size_t MAX_PAYLOAD_SIZE = 4096; // scale this shit up */
@@ -1019,8 +1020,10 @@ void process_timers() {
       break;
   }
 }
+void print_banner() { system("figlet CARROT"); }
 
 int main(int argc, char *argv[]) {
+  print_banner();
   dlist_init(&g_data.dummy);
   g_data.fdconn = (struct Conn **)calloc(8, sizeof(struct Conn *));
   if (g_data.fdconn == NULL) {
@@ -1039,8 +1042,8 @@ int main(int argc, char *argv[]) {
   int fd;
   struct sockaddr_in server;
   bzero(&server, sizeof(server));
-  if (argc < 2)
-    perror("port no.");
+  if (argc < 1)
+    perror("command not found");
   fd = socket(PF_INET, SOCK_STREAM, 0); // socket syscall
   if (fd < 0)
     error("socket() error");
@@ -1049,7 +1052,7 @@ int main(int argc, char *argv[]) {
 
   server.sin_family = AF_INET;
   server.sin_addr.s_addr = INADDR_ANY;
-  server.sin_port = htons(atoi(argv[1]));
+  server.sin_port = htons(PORT);
   nonB(fd);
   if (bind(fd, (const struct sockaddr *)&server, sizeof(server)) < 0) {
     error("bind() error");
