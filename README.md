@@ -27,34 +27,56 @@ chmod +x build.sh
 ```bash
 ./build.sh
 ```
-
-This will initialize CMake and build both the server and client binaries.
-
 ## Running the Server
 
-Start the server by specifying a port number:
+Start the server:
 ```bash
 cd build
-./bin <port>
+./bin
 ```
-
-Example:
-```bash
-cd build
-./bin 6379
-```
+This will initialize CMake and build both the server and client binaries.
 
 ## Using the Client
 
 The client can be used to send commands to the server:
 ```bash
 cd build
-./client <hostname> <port> <command>
+./client <command>
 ```
 
 Example:
 ```bash
-./client localhost 6379 get mykey
+./client get mykey
+```
+
+
+## Building from Docker
+
+1. Clone the repository:
+```bash
+git clone git@github.com:devansh-srv/carrot.git
+cd carrot
+```
+
+2. Build docker image:
+```bash
+docker build -t carrot
+```
+## Running the Server using docker
+
+Start the server using docker image:
+```bash
+docker run --name carrot-server -p 12345:12345 carrot
+```
+
+## Using the Client using docker exec
+```bash
+docker exec -it carrot-server sh 
+```
+
+Commands:
+```bash
+/app/client get mykey
 ```
 
 ## Supported Commands
@@ -146,3 +168,4 @@ Parameters:
 ## Contributing
 
 Feel free to submit issues and pull requests.
+
